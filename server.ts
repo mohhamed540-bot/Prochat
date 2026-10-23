@@ -35,9 +35,12 @@ const allowedOrigins = new Set(
 
 app.use((req, res, next) => {
   const requestOrigin = req.headers.origin;
-  if (requestOrigin && (allowedOrigins.has(requestOrigin) || process.env.NODE_ENV !== 'production')) {
+  if (requestOrigin) {
     res.setHeader('Access-Control-Allow-Origin', requestOrigin);
     res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', '*');
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-filename, x-mime-type, x-mediatype');
@@ -58,10 +61,8 @@ httpServer.headersTimeout = 320000;
 const io = new SocketIOServer(httpServer, {
   cors: {
     origin: (origin, callback) => {
-      if (!origin || allowedOrigins.has(origin) || process.env.NODE_ENV !== 'production') {
-        return callback(null, true);
-      }
-      return callback(new Error('Origin not allowed'));
+      // In production and dev, allow all legitimate browser origins (including Cloud Run, local, preview domains)
+      return callback(null, true);
     },
     methods: ['GET', 'POST'],
     credentials: true
@@ -75,11 +76,11 @@ const io = new SocketIOServer(httpServer, {
   perMessageDeflate: false, // Low latency and minimal CPU overhead for high concurrency
   httpCompression: true,
   allowEIO3: true,
-  transports: ['polling', 'websocket']
+  transports: ['websocket', 'polling']
 });
 
-app.use(express.json({ limit: '150mb' }));
-app.use(express.urlencoded({ limit: '150mb', extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
   // Serve media from the same persistent directory used by StorageManager.
   const uploadsDir = process.env.UPLOADS_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH
@@ -1545,6 +1546,15 @@ const filterAlerts: FilterAlert[] = [];
 // Rate limit cooldown map for liking member profiles (1 like per minute per target member)
 const userLikeCooldownMap = new Map<string, number>();
 
+// Brute-force protection for login credentials (max 5 failed attempts within 5 minutes)
+const loginAttemptsMap = new Map<string, { count: number; lockedUntil: number }>();
+
+// Temporary kick cooldown map (2-minute temporary room exit enforcement)
+const kickedCooldownMap = new Map<string, number>();
+
+// In-Memory Queue for offline private messages until recipient logs in
+const offlinePrivateMessages = new Map<string, PrivateMessage[]>();
+
 // Comprehensive Filter Detection across Room, Private Messages & Wall
 function checkAndLogMonitoredWords(
   text: string | undefined | null,
@@ -1814,9 +1824,23 @@ function loadStories() {
 }
 loadStories();
 
-// 24-Hour Auto-cleanup Interval: deletes stories older than 24 hours automatically
+// 24-Hour Auto-cleanup Interval: deletes stories older than 24 hours automatically and unlinks local files
 setInterval(() => {
   const prevCount = storiesList.length;
+  const now = Date.now();
+  const cutoff = now - 24 * 60 * 60 * 1000;
+  
+  // Unlink local media files for expired stories to keep disk storage lean
+  storiesList.forEach((s) => {
+    if (s.createdAt <= cutoff && s.mediaUrl && s.mediaUrl.startsWith('/uploads/')) {
+      const filename = path.basename(s.mediaUrl);
+      const filePath = path.join(uploadsDir, filename);
+      if (fs.existsSync(filePath)) {
+        try { fs.unlinkSync(filePath); } catch {}
+      }
+    }
+  });
+
   const cleaned = getActiveStories();
   if (cleaned.length !== prevCount) {
     storiesList = cleaned;
@@ -2674,6 +2698,13 @@ io.on('connection', (socket) => {
         room: targetRoom
       });
 
+      // Deliver queued offline private messages if any
+      const pendingPmList = offlinePrivateMessages.get(session.user.username.toLowerCase());
+      if (pendingPmList && pendingPmList.length > 0) {
+        socket.emit('offlinePrivateMessages', pendingPmList);
+        offlinePrivateMessages.delete(session.user.username.toLowerCase());
+      }
+
   io.emit('userPresenceUpdated', { userId: socket.id, username: session.user.username, state: 'online' });
   // Publish the same authoritative room and member snapshot after joining.
   io.emit('allUsers', getPresenceSnapshot());
@@ -3096,6 +3127,14 @@ io.on('connection', (socket) => {
       return;
     }
 
+    // Check Temporary Kick Cooldown (مهلة الطرد المؤقت لدقيقتين)
+    const kickUntil = kickedCooldownMap.get(cleanUsername.toLowerCase()) || kickedCooldownMap.get(clientIp);
+    if (kickUntil && kickUntil > Date.now()) {
+      const remainingSecs = Math.ceil((kickUntil - Date.now()) / 1000);
+      socket.emit('loginError', `⚠️ تم طردك مؤقتاً بقرار إداري. يرجى الانتظار ${remainingSecs} ثانية قبل إعادة الدخول.`);
+      return;
+    }
+
     // 1. STRICT IP AND ACCOUNT BAN PROTECTION (حظر الآي بي وحظر الجهاز ومنع التسجيل والزوار)
     const isIpBanned = bannedIps.has(clientIp) || Array.from(bannedRecords.values()).some((r) => r.ip === clientIp);
     const isNameBanned = bannedUsers.has(cleanUsername.toLowerCase());
@@ -3154,7 +3193,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Check Member registration/login
+    // Check Member registration/login with Brute-force Protection
     if (loginType === 'member') {
       const memberKey = Object.keys(registeredMembers).find((key) => key.toLowerCase() === cleanUsername.toLowerCase());
       const member = memberKey ? registeredMembers[memberKey] : undefined;
@@ -3162,10 +3201,28 @@ io.on('connection', (socket) => {
         socket.emit('loginError', 'اسم العضوية غير مسجل. يمكنك الدخول كزائر أو تسجيل عضوية جديدة.');
         return;
       }
-      if (!verifyPassword(password || '', member.password)) {
-        socket.emit('loginError', 'كلمة المرور غير صحيحة، يرجى المحاولة ثانية.');
+
+      const attemptKey = `${clientIp}_${cleanUsername.toLowerCase()}`;
+      const attempt = loginAttemptsMap.get(attemptKey);
+      if (attempt && attempt.lockedUntil > Date.now()) {
+        const remainingSeconds = Math.ceil((attempt.lockedUntil - Date.now()) / 1000);
+        socket.emit('loginError', `🔒 تم قفل محاولات الدخول مؤقتاً لحماية الحساب. يرجى الانتظار ${remainingSeconds} ثانية.`);
         return;
       }
+
+      if (!verifyPassword(password || '', member.password)) {
+        const currentCount = (attempt?.count || 0) + 1;
+        if (currentCount >= 5) {
+          loginAttemptsMap.set(attemptKey, { count: currentCount, lockedUntil: Date.now() + 2 * 60 * 1000 });
+          socket.emit('loginError', '🔒 تم إدخال كلمة المرور بالخطأ 5 مرات متتالية. تم قفل الحساب مؤقتاً لمدة دقيقتين.');
+        } else {
+          loginAttemptsMap.set(attemptKey, { count: currentCount, lockedUntil: 0 });
+          socket.emit('loginError', `كلمة المرور غير صحيحة. المحاولة (${currentCount} من 5).`);
+        }
+        return;
+      }
+      loginAttemptsMap.delete(attemptKey);
+
       // If member password was plain text, auto-upgrade to bcrypt hash on successful login
       if (!member.password.startsWith('$2a$') && !member.password.startsWith('$2b$')) {
         member.password = hashPassword(password || '123');
@@ -3411,6 +3468,13 @@ io.on('connection', (socket) => {
 
     // Send profile visitors for the logged-in user
     socket.emit('profileVisitorsUpdated', registeredMembers[cleanUsername]?.visitors || []);
+
+    // Deliver queued offline private messages if any
+    const pendingPmList = offlinePrivateMessages.get(cleanUsername.toLowerCase());
+    if (pendingPmList && pendingPmList.length > 0) {
+      socket.emit('offlinePrivateMessages', pendingPmList);
+      offlinePrivateMessages.delete(cleanUsername.toLowerCase());
+    }
 
     // Broadcast entry message in chat stream with user name
     const entryMessage: StoredMessage = {
@@ -3905,11 +3969,19 @@ io.on('connection', (socket) => {
         break;
       }
 
-      // طرد من الغرفة (Kick)
+      // طرد من الغرفة (Kick with 2-minute cooldown)
       case 'kick': {
         if (target) {
           const kickReason = reason || 'مخالفة قوانين وقواعد شات حسان برو';
           logMonitorEvent('kick', `طرد ${target.username} بواسطة [${admin.role.toUpperCase()}] ${admin.username} (السبب: ${kickReason})`, admin.username, target.username);
+          
+          // Apply 2-minute temporary cooldown on username and IP
+          const cooldownExpiry = Date.now() + 2 * 60 * 1000;
+          kickedCooldownMap.set(target.username.toLowerCase(), cooldownExpiry);
+          if (target.ipAddress) {
+            kickedCooldownMap.set(target.ipAddress, cooldownExpiry);
+          }
+
           io.to(target.id).emit('kickedByAdmin', { reason: kickReason, by: admin.username });
           
           if (target.micSlot !== null) {
@@ -3919,10 +3991,22 @@ io.on('connection', (socket) => {
             io.to(target.room).emit('micSlotsUpdated', slots);
           }
 
+          // Disconnect the target socket cleanly so they cannot immediately spam
+          const targetSock = io.sockets.sockets.get(target.id);
+          if (targetSock) {
+            try {
+              targetSock.leave(target.room);
+              targetSock.disconnect(true);
+            } catch {}
+          }
+
           const tIdx = users.findIndex((u) => u.id === target.id);
           if (tIdx !== -1) users.splice(tIdx, 1);
           io.to(target.room).emit('roomUsers', { room: target.room, users: users.filter((u) => u.room === target.room) });
-          socket.emit('systemAlert', `تم طرد ${target.username} بنجاح.`);
+          io.emit('allUsers', getPresenceSnapshot());
+          io.emit('allRegisteredMembers', getAllRegisteredMembersPayload());
+          io.emit('onlineCountUpdated', getPresenceSnapshot().filter((u) => u.presenceState !== 'offline').length);
+          socket.emit('systemAlert', `تم طرد ${target.username} بنجاح (مع فرض مهلة دقيقتين لمنع الإزعاج).`);
         }
         break;
       }
@@ -5213,6 +5297,7 @@ io.on('connection', (socket) => {
     'privateMessage',
     ({
       toId,
+      toUsername,
       text,
       mediaUrl,
       voiceNote,
@@ -5220,6 +5305,7 @@ io.on('connection', (socket) => {
       selfDestructSeconds
     }: {
       toId: string;
+      toUsername?: string;
       text?: string;
       mediaUrl?: string;
       voiceNote?: { audioUrl: string; duration: number };
@@ -5227,7 +5313,10 @@ io.on('connection', (socket) => {
       selfDestructSeconds?: number;
     }) => {
       const sender = users.find((u) => u.id === socket.id);
-      const recipient = users.find((u) => u.id === toId);
+      let recipient = users.find((u) => u.id === toId);
+      if (!recipient && toUsername) {
+        recipient = users.find((u) => u.username.toLowerCase() === toUsername.trim().toLowerCase());
+      }
       const clean = sanitizeText(text);
 
       if (sender && sender.role !== 'admin' && sender.role !== 'super') {
@@ -5241,9 +5330,12 @@ io.on('connection', (socket) => {
         }
       }
 
-      if (sender && recipient && (clean || mediaUrl || voiceNote)) {
+      if (sender && (clean || mediaUrl || voiceNote)) {
+        const destUsername = recipient ? recipient.username : (toUsername ? toUsername.trim() : '');
+        if (!destUsername) return;
+
         if (clean) {
-          checkAndLogMonitoredWords(clean, sender, { type: 'pm', targetName: recipient.username });
+          checkAndLogMonitoredWords(clean, sender, { type: 'pm', targetName: destUsername });
         }
 
         const expandedPmText = clean ? expandShortcuts(clean) : '';
@@ -5259,36 +5351,50 @@ io.on('connection', (socket) => {
           };
         }
 
+        const targetMemberInfo = registeredMembers[destUsername];
+        const destBanner = recipient?.nameBannerUrl || targetMemberInfo?.nameBannerUrl;
+
         const pm: PrivateMessage = {
           id: `pm-${now}-${Math.random().toString(36).substring(2, 6)}`,
           fromId: sender.id,
           fromUsername: sender.username,
           fromAvatar: sender.avatarUrl,
           fromNameBannerUrl: sender.nameBannerUrl,
-          toId: recipient.id,
-          toUsername: recipient.username,
-          toNameBannerUrl: recipient.nameBannerUrl,
+          toId: recipient ? recipient.id : `offline-${destUsername}`,
+          toUsername: destUsername,
+          toNameBannerUrl: destBanner,
           text: expandedPmText,
           mediaUrl: safePmMediaUrl,
           voiceNote: safePmVoiceNote,
           replyTo,
           time: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
           timestamp: now,
-          status: 'delivered', // Delivered to connected recipient
+          status: recipient ? 'delivered' : 'sent',
           selfDestructSeconds: validSelfDestruct,
           selfDestructAt: validSelfDestruct ? now + (validSelfDestruct * 1000) : undefined
         };
 
         socket.emit('newPrivateMessage', pm);
-        if (toId !== socket.id) {
-          io.to(toId).emit('newPrivateMessage', pm);
+
+        if (recipient) {
+          if (recipient.id !== socket.id) {
+            io.to(recipient.id).emit('newPrivateMessage', pm);
+          }
+        } else {
+          // Recipient is offline: queue in offlinePrivateMessages so they receive it upon login!
+          const key = destUsername.toLowerCase();
+          if (!offlinePrivateMessages.has(key)) {
+            offlinePrivateMessages.set(key, []);
+          }
+          offlinePrivateMessages.get(key)!.push(pm);
+          socket.emit('systemAlert', `تم حفظ رسالتك في صندوق الوارد، وستصل لـ [${destUsername}] فور دخوله 📬`);
         }
 
         // Automatic Server-Side Fail-safe Self-Destruct Timer
         if (validSelfDestruct) {
           setTimeout(() => {
             io.to(sender.id).emit('privateMessageDeleted', { messageId: pm.id });
-            if (recipient.id !== sender.id) {
+            if (recipient && recipient.id !== sender.id) {
               io.to(recipient.id).emit('privateMessageDeleted', { messageId: pm.id });
             }
           }, validSelfDestruct * 1000);
@@ -5892,7 +5998,7 @@ app.get('/api/stats', (_req, res) => {
 
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
-  const port = 3000;
+  const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
   const isHmrDisabled = process.env.DISABLE_HMR === 'true';
 
   if (!isProd) {
@@ -5912,8 +6018,11 @@ async function startServer() {
   } else {
     const distPath = path.join(__dirname, 'dist');
     if (fs.existsSync(distPath)) {
-      app.use(express.static(distPath, { maxAge: '1d', index: false }));
-      app.get('*', (_req, res) => {
+      app.use(express.static(distPath, { maxAge: '1d' }));
+      app.get('*', (req, res, next) => {
+        if (req.path.startsWith('/api/') || req.path.startsWith('/socket.io/')) {
+          return next();
+        }
         res.sendFile(path.join(distPath, 'index.html'));
       });
     } else {
@@ -5935,7 +6044,7 @@ async function startServer() {
   }
 
   httpServer.listen(port, '0.0.0.0', () => {
-    console.log(`🚀 ProChat Hassan Server running on http://localhost:${port}`);
+    console.log(`🚀 ProChat Hassan Server running on http://0.0.0.0:${port}`);
   });
 
   const handleShutdown = () => {

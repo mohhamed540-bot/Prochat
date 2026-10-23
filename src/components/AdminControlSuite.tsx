@@ -3456,13 +3456,13 @@ export const AdminControlSuite: React.FC<AdminControlSuiteProps> = ({
                 <button
                   type="button"
                   onClick={() => {
-                    setGeneralWelcomeTitle('مجلس الصقور 🦅');
-                    setGeneralWelcomeText('مرحباً بصقرنا الغالي في مجلس الصقور .. حياك الله وبياك في شات حسان برو ملتقى الأصالة والشهامة 🦅✨');
+                    setGeneralWelcomeTitle('مجلس حسان برو 🦅');
+                    setGeneralWelcomeText('مرحباً بعضونا الغالي في مجلس حسان برو .. حياك الله وبياك في ملتقى الأصالة والشهامة 🦅✨');
                   }}
                   className="p-2 text-right rounded-xl bg-slate-950/70 hover:bg-slate-900 border border-slate-800 text-[10px] text-amber-200 cursor-pointer"
                 >
-                  <span className="font-bold block text-amber-300 mb-0.5">🦅 ترحيب الصقور</span>
-                  <span className="line-clamp-1 opacity-80">مرحباً بصقرنا الغالي في مجلس الصقور...</span>
+                  <span className="font-bold block text-amber-300 mb-0.5">🦅 ترحيب مجلس حسان</span>
+                  <span className="line-clamp-1 opacity-80">مرحباً بعضونا الغالي في مجلس حسان برو...</span>
                 </button>
                 <button
                   type="button"

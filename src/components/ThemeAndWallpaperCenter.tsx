@@ -984,7 +984,7 @@ export const ThemeAndWallpaperCenter: React.FC<ThemeAndWallpaperCenterProps> = (
                               : 'rounded-xl bg-slate-800 border border-slate-600 text-slate-200'
                           }`}
                         >
-                          أهلاً بكم في الصقور 🦅
+                          أهلاً بكم في حسان برو 🦅
                         </div>
                       </div>
                     </button>

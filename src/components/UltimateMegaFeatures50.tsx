@@ -327,7 +327,7 @@ export const UltimateMegaFeatures50: React.FC<UltimateMegaFeatures50Props> = ({
   const [scheduledMinutes, setScheduledMinutes] = useState<number>(5);
 
   // --- 21. Room MOTD Announcement ---
-  const [roomMotd, setRoomMotd] = useState('أهلاً بكم في مجلس صقور العرب! يرجى الالتزام بآداب الحوار واحترام الجميع 🦅✨');
+  const [roomMotd, setRoomMotd] = useState('أهلاً بكم في شات حسان برو! يرجى الالتزام بآداب الحوار واحترام الجميع 🦅✨');
   const [editingMotd, setEditingMotd] = useState(false);
 
   // --- 23. Slow Mode Controller ---
@@ -614,7 +614,7 @@ export const UltimateMegaFeatures50: React.FC<UltimateMegaFeatures50Props> = ({
   };
 
   const handleDownloadChatLog = () => {
-    const textContent = `سجل محادثات مجلس صقور العرب\nالتاريخ: ${new Date().toLocaleString('ar-SA')}\nالغرفة: ${currentUser.room}\nالمستخدم: ${currentUser.username}\n\n-- تم التصدير بأمان عبر منصة حسان برو --`;
+    const textContent = `سجل محادثات شات حسان برو\nالتاريخ: ${new Date().toLocaleString('ar-SA')}\nالغرفة: ${currentUser.room}\nالمستخدم: ${currentUser.username}\n\n-- تم التصدير بأمان عبر منصة حسان برو --`;
     const blob = new Blob([textContent], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1105,7 +1105,7 @@ export const UltimateMegaFeatures50: React.FC<UltimateMegaFeatures50Props> = ({
                     id="ttsInputSample"
                     placeholder="اكتب أي نص هنا لتجربة القراءة الصوتية الفصحى..."
                     className="flex-1 bg-slate-900 border border-slate-750 rounded-xl px-3 py-1.5 text-xs text-slate-200 placeholder:text-slate-500"
-                    defaultValue="مرحباً بكم في شات صقور العرب للمحادثات الصوتية والنصية"
+                    defaultValue="مرحباً بكم في شات حسان برو للمحادثات الصوتية والنصية"
                   />
                   <button
                     onClick={() => {
@@ -2344,7 +2344,7 @@ export const UltimateMegaFeatures50: React.FC<UltimateMegaFeatures50Props> = ({
                     <Crown className="w-3.5 h-3.5 text-yellow-400" />
                     <span>ميزة 50: صالة الشرف وفرسان الأسبوع (Hall of Fame Top Falcons)</span>
                   </div>
-                  <span className="text-[10px] text-slate-400">نخبة مجلس صقور العرب</span>
+                  <span className="text-[10px] text-slate-400">نخبة أعضاء حسان برو</span>
                 </div>
                 <div className="space-y-1 max-h-36 overflow-y-auto">
                   {HALL_OF_FAME.map((falcon) => (

@@ -2,15 +2,25 @@
 
 import { Socket } from 'socket.io-client';
 
-const ICE_SERVERS = {
+const ICE_SERVERS: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
     { urls: 'stun:stun3.l.google.com:19302' },
     { urls: 'stun:stun4.l.google.com:19302' },
-    { urls: 'stun:global.stun.twilio.com:3478' }
-  ]
+    { urls: 'stun:global.stun.twilio.com:3478' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp'
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ],
+  iceCandidatePoolSize: 10
 };
 
 export interface RemoteVoicePeer {
@@ -310,6 +320,20 @@ export class AudioMeshManager {
 
       const checkVolume = () => {
         if (!this.analyser || !this.isInVoice) return;
+
+        // Skip heavy audio FFT calculations while muted to preserve CPU & mobile battery
+        if (this.isMuted) {
+          if (this.lastSpeakingState) {
+            this.lastSpeakingState = false;
+            this.socket.emit('voiceStateUpdate', { isSpeaking: false });
+          }
+          if (this.onVolumeChange) {
+            this.onVolumeChange(0);
+          }
+          this.animFrameId = requestAnimationFrame(checkVolume);
+          return;
+        }
+
         this.analyser.getByteFrequencyData(dataArray);
 
         let sum = 0;
@@ -320,11 +344,11 @@ export class AudioMeshManager {
         const volumePercent = Math.min(100, Math.round((avg / 128) * 100));
 
         if (this.onVolumeChange) {
-          this.onVolumeChange(this.isMuted ? 0 : volumePercent);
+          this.onVolumeChange(volumePercent);
         }
 
         // Speaking state threshold
-        const isSpeakingNow = !this.isMuted && volumePercent > 12;
+        const isSpeakingNow = volumePercent > 12;
         if (isSpeakingNow !== this.lastSpeakingState) {
           this.lastSpeakingState = isSpeakingNow;
           this.socket.emit('voiceStateUpdate', { isSpeaking: isSpeakingNow });
@@ -424,6 +448,13 @@ export class AudioMeshManager {
 
     this.socket.emit('leaveVoice');
     this.notifyPeers();
+  }
+
+  // Check if WebRTC connection is already active and streaming with peer to avoid duplicate audio fallback
+  public hasConnectedPeer(id: string): boolean {
+    const peer = this.peers.get(id);
+    if (!peer || !peer.pc) return false;
+    return peer.pc.connectionState === 'connected' || peer.pc.iceConnectionState === 'connected';
   }
 
   // Complete cleanup and destroy manager instance

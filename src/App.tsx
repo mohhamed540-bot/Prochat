@@ -676,8 +676,7 @@ export default function App() {
   // Chat Shortcuts State (الاختصارات الذكية للشات)
   const [shortcuts, setShortcuts] = useState<ChatShortcut[]>([]);
 
-  // Official Warning Active Dialog State (Custom in-app modal)
-  const [activeWarning, setActiveWarning] = useState<{ from: string; text: string } | null>(null);
+
   const [warningModalTarget, setWarningModalTarget] = useState<User | null>(null);
   const [customWarningText, setCustomWarningText] = useState('');
 
@@ -1000,6 +999,7 @@ export default function App() {
 
   // WebRTC Audio Mesh
   const [audioManager, setAudioManager] = useState<AudioMeshManager | null>(null);
+  const audioManagerRef = useRef<AudioMeshManager | null>(null);
   const [micVolume, setMicVolume] = useState(0);
 
   // Control Panel Tabs & Filter State
@@ -1037,8 +1037,10 @@ export default function App() {
   const [receivedOfficialWarning, setReceivedOfficialWarning] = useState<{ from: string; text: string } | null>(null);
   const [criticalBroadcast, setCriticalBroadcast] = useState<{ id: string; title: string; text: string; sender: string; senderRole: string; time: string } | null>(null);
   const [broadcastTitleInput, setBroadcastTitleInput] = useState('تنبيه ملكي عاجل من إدارة حسان برو 🦅');
-  const [broadcastTextInput, setBroadcastTextInput] = useState('');
+  const [passwordPromptRoom, setPasswordPromptRoom] = useState<ChatRoom | null>(null);
   const [roomPasswordInput, setRoomPasswordInput] = useState('');
+  const [showRoomPasswordText, setShowRoomPasswordText] = useState(false);
+  const [roomPasswordError, setRoomPasswordError] = useState<string | null>(null);
   const [controlRoleFilter, setControlRoleFilter] = useState<'all' | 'admin' | 'super' | 'member' | 'guest'>('all');
   const [controlSearchQuery, setControlSearchQuery] = useState('');
   const [logTypeFilter, setLogTypeFilter] = useState<'all' | 'kick_ban' | 'mute' | 'mic' | 'role'>('all');
@@ -1463,8 +1465,8 @@ export default function App() {
 
     // Connect to custom backend URL (e.g. Railway when hosted on Vercel) or current origin (when hosted on Railway)
     const remoteServerUrl =
-      (import.meta.env.VITE_SERVER_URL as string) ||
-      (import.meta.env.VITE_API_URL as string) ||
+      (import.meta.env.VITE_SERVER_URL as string)?.trim() ||
+      (import.meta.env.VITE_API_URL as string)?.trim() ||
       undefined;
     const socketOptions = {
       reconnection: true,
@@ -1473,7 +1475,7 @@ export default function App() {
       reconnectionDelayMax: 3000,
       randomizationFactor: 0.2,
       timeout: 30000,
-      transports: ['polling', 'websocket'],
+      transports: ['websocket', 'polling'],
       autoConnect: true
     };
     const s = remoteServerUrl ? io(remoteServerUrl, socketOptions) : io(socketOptions);
@@ -2074,6 +2076,10 @@ export default function App() {
 
     s.on('remoteVoiceChunk', (data: { userId: string; username: string; micSlot: number; chunk: string }) => {
       if (isSpeakerMuted) return;
+      if (audioManagerRef.current?.hasConnectedPeer(data.userId)) {
+        // Direct WebRTC peer connection is active and streaming track; skip fallback chunk to prevent echo
+        return;
+      }
       try {
         const audio = new Audio(data.chunk);
         audio.volume = 0.95;
@@ -2294,6 +2300,22 @@ export default function App() {
       setRoomsList(rooms);
     });
 
+    s.on('offlinePrivateMessages', (messages: PrivateMessage[]) => {
+      if (!Array.isArray(messages) || messages.length === 0) return;
+      setPrivateMessages((prev) => {
+        const safe = Array.isArray(prev) ? prev : [];
+        const existingIds = new Set(safe.map((m) => m?.id));
+        const newOnes = messages.filter((m) => m && !existingIds.has(m.id));
+        const updated = [...safe, ...newOnes];
+        return updated.length > 500 ? updated.slice(-500) : updated;
+      });
+      sounds.playPrivateMessagePing();
+      try {
+        navigator.vibrate?.([30, 60, 30]);
+      } catch {}
+      showToast(`📬 لديك ${messages.length} رسالة خاصة جديدة في صندوق الوارد!`, 'info');
+    });
+
     s.on('newPrivateMessage', (pm: PrivateMessage) => {
       if (!pm) return;
       setPrivateMessages((prev) => {
@@ -2320,6 +2342,9 @@ export default function App() {
         } catch {}
 
         sounds.playPrivateMessagePing();
+        try {
+          navigator.vibrate?.([20, 50, 20]);
+        } catch {}
         const otherUsername = pm.fromUsername;
 
         // Check if user is currently looking at this exact private conversation and window is visible
@@ -2446,28 +2471,22 @@ export default function App() {
       setMonitorLogs(logs);
     });
 
-    s.on('monitorEvent', (log: MonitorEvent) => {
-      setMonitorLogs((prev) => [log, ...prev.slice(0, 150)]);
-    });
-
     s.on('systemAlert', (msg: string) => {
       sounds.playGeneralAlertPing();
       showToast(msg, 'info');
     });
 
-    s.on('officialWarning', ({ from, text }: { from: string; text: string }) => {
-      sounds.playGeneralAlertPing();
-      setActiveWarning({ from, text });
-    });
-
     s.on('micRevokedByAdmin', ({ adminName }: { adminName: string }) => {
       sounds.playVoiceLeave();
-      alert(`تم سحب المايك منك بواسطة الإداري (${adminName}).`);
+      showToast(`تم سحب المايك منك بواسطة الإداري (${adminName}).`, 'info');
     });
 
     s.on('kickedByAdmin', ({ reason }: { reason: string }) => {
-      alert(`تم طردك بواسطة إدارة حسان برو!\nالسبب: ${reason}`);
-      window.location.reload();
+      sounds.playError();
+      showToast(`تم طردك بواسطة إدارة حسان برو! السبب: ${reason}`, 'error');
+      setTimeout(() => {
+        window.location.reload();
+      }, 1500);
     });
 
     s.on('forceLogout', ({ reason, message }: { reason?: string; message?: string }) => {
@@ -2552,6 +2571,7 @@ export default function App() {
 
     // Audio Mesh setup
     const manager = new AudioMeshManager(s);
+    audioManagerRef.current = manager;
     manager.onVolumeChange = (vol) => setMicVolume(vol);
     manager.onError = (err) => {
       sounds.playError();
@@ -2560,9 +2580,10 @@ export default function App() {
     setAudioManager(manager);
 
     return () => {
-    clearInterval(pingTicker);
-    window.clearTimeout(appearanceFallbackTimer);
-    cleanupVisibility();
+      clearInterval(pingTicker);
+      window.clearTimeout(appearanceFallbackTimer);
+      cleanupVisibility();
+      audioManagerRef.current = null;
       manager.destroy();
       s.removeAllListeners();
       s.disconnect();
@@ -2848,6 +2869,29 @@ export default function App() {
     showToast('تم إرسال ردك وتوضيحك للإدارة بنجاح ✉️', 'success');
   };
 
+  // Confirm password for protected room entry
+  const handleConfirmRoomPassword = () => {
+    if (!passwordPromptRoom || !currentUser) return;
+    if (roomPasswordInput.trim() !== passwordPromptRoom.password) {
+      sounds.playError();
+      setRoomPasswordError('كلمة المرور غير صحيحة، يرجى إعادة المحاولة');
+      return;
+    }
+    sounds.playMemberJoin();
+    setMessages([]);
+    socket?.emit('joinRoom', {
+      username: currentUser.username,
+      room: passwordPromptRoom.id,
+      flag: currentUser.flag,
+      statusQuote: currentUser.statusQuote
+    });
+    setPasswordPromptRoom(null);
+    setRoomPasswordInput('');
+    setRoomPasswordError(null);
+    setActiveDrawer('none');
+    showToast(`تم الدخول إلى [${passwordPromptRoom.name}] بنجاح 🚀`, 'success');
+  };
+
   // Direct media download helper
   const handleDownloadMedia = async (url: string, filename?: string) => {
     try {
@@ -2913,6 +2957,9 @@ export default function App() {
     }
 
     socket.emit('chatMessage', messagePayload);
+    try {
+      navigator.vibrate?.(12);
+    } catch {}
 
     notifyTyping(false);
     setTextInput('');
@@ -4226,42 +4273,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Official In-App Warning Dialog */}
-      {activeWarning && (
-        <div
-          onClick={(e) => {
-            if (e.target === e.currentTarget) setActiveWarning(null);
-          }}
-          className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4 backdrop-blur-xs animate-in fade-in duration-200 text-right"
-        >
-          <div className="w-full max-w-sm bg-white rounded-2xl shadow-2xl border-2 border-rose-500 overflow-hidden text-slate-900">
-            <div className="bg-gradient-to-r from-rose-700 to-red-600 text-white p-3.5 flex items-center justify-between">
-              <div className="flex items-center gap-2 font-bold text-sm">
-                <AlertCircle className="w-5 h-5 text-amber-300 animate-bounce" />
-                <span>⚠️ تنبيه إداري رسمي فوري</span>
-              </div>
-              <span className="px-2 py-0.5 rounded bg-black/30 text-[10px] font-bold">حسان برو</span>
-            </div>
-            <div className="p-4 space-y-3">
-              <div className="text-xs text-slate-500">
-                مرسل من قِبل المشرف / الإداري: <span className="font-bold text-rose-700">[{activeWarning.from}]</span>
-              </div>
-              <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-rose-950 font-semibold text-xs leading-relaxed whitespace-pre-wrap">
-                {activeWarning.text}
-              </div>
-              <p className="text-[11px] text-slate-500 leading-tight">
-                يرجى الالتزام بقواعد الشات وآداب الحوار تجنباً لتطبيق عقوبات الطرد أو الحظر (الباند).
-              </p>
-              <button
-                onClick={() => setActiveWarning(null)}
-                className="w-full py-2.5 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-xl shadow-md transition-all cursor-pointer"
-              >
-                فهمت ذلك وسألتزم بالقوانين ✔️
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+
 
       {/* Admin/Supervisor Warning Dispatch Modal */}
       {warningModalTarget && (
@@ -7719,12 +7731,12 @@ export default function App() {
                 <div
                   key={r.id}
                   onClick={() => {
-                    if (r.isPasswordProtected) {
-                      const pass = prompt('هذه الغرفة محمية بكلمة مرور. أدخل كلمة المرور:');
-                      if (pass !== r.password) {
-                        alert('كلمة المرور غير صحيحة!');
-                        return;
-                      }
+                    if (r.isPasswordProtected && currentUser.role !== 'admin' && currentUser.room !== r.id) {
+                      setPasswordPromptRoom(r);
+                      setRoomPasswordInput('');
+                      setShowRoomPasswordText(false);
+                      setRoomPasswordError(null);
+                      return;
                     }
                     setMessages([]);
                     socket?.emit('joinRoom', {
@@ -9355,6 +9367,7 @@ export default function App() {
                         onSendVoice={(voiceData) => {
                           socket?.emit('privateMessage', {
                             toId: selectedPmUser.id,
+                            toUsername: selectedPmUser.username,
                             text: '',
                             voiceNote: voiceData,
                             replyTo: pmReplyingTo || undefined,
@@ -9380,6 +9393,7 @@ export default function App() {
                             handleFileUpload(e, (dataUrl) => {
                               socket?.emit('privateMessage', {
                                 toId: selectedPmUser.id,
+                                toUsername: selectedPmUser.username,
                                 text: '',
                                 mediaUrl: dataUrl,
                                 replyTo: pmReplyingTo || undefined,
@@ -9516,6 +9530,7 @@ export default function App() {
                             const expandedText = expandClientShortcuts(pmInput.trim(), shortcuts);
                             socket?.emit('privateMessage', {
                               toId: selectedPmUser.id,
+                              toUsername: selectedPmUser.username,
                               text: expandedText,
                               replyTo: pmReplyingTo || undefined,
                               selfDestructSeconds: pmSelfDestructSeconds > 0 ? pmSelfDestructSeconds : undefined
@@ -9532,6 +9547,7 @@ export default function App() {
                             const expandedText = expandClientShortcuts(pmInput.trim(), shortcuts);
                             socket?.emit('privateMessage', {
                               toId: selectedPmUser.id,
+                              toUsername: selectedPmUser.username,
                               text: expandedText,
                               replyTo: pmReplyingTo || undefined,
                               selfDestructSeconds: pmSelfDestructSeconds > 0 ? pmSelfDestructSeconds : undefined
@@ -11465,6 +11481,102 @@ export default function App() {
               >
                 إغلاق والتعهد بالالتزام 🤝
               </button>
+            </div>
+          </div>
+        )}
+
+        {/* Password Protected Room Entry Modal */}
+        {passwordPromptRoom && (
+          <div
+            onClick={(e) => {
+              if (e.target === e.currentTarget) {
+                setPasswordPromptRoom(null);
+                setRoomPasswordInput('');
+                setRoomPasswordError(null);
+              }
+            }}
+            className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4 backdrop-blur-xs animate-in fade-in"
+          >
+            <div className="w-full max-w-sm bg-slate-900 border border-amber-500/50 rounded-2xl p-5 shadow-2xl text-right space-y-4 text-slate-100">
+              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-10 h-10 rounded-xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-400">
+                    <Lock className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-black text-sm text-amber-300">غرفة محمية برمز سري</h3>
+                    <p className="text-[11px] text-slate-400 font-bold">{passwordPromptRoom.name}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPasswordPromptRoom(null);
+                    setRoomPasswordInput('');
+                    setRoomPasswordError(null);
+                  }}
+                  className="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white flex items-center justify-center text-xs cursor-pointer"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-300 block">
+                  أدخل كلمة المرور لدخول الغرفة:
+                </label>
+                <div className="relative">
+                  <input
+                    type={showRoomPasswordText ? 'text' : 'password'}
+                    autoFocus
+                    value={roomPasswordInput}
+                    onChange={(e) => {
+                      setRoomPasswordInput(e.target.value);
+                      if (roomPasswordError) setRoomPasswordError(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleConfirmRoomPassword();
+                    }}
+                    placeholder="كلمة المرور..."
+                    className="w-full bg-slate-950 border border-slate-700 focus:border-amber-400 rounded-xl px-3 py-2 text-xs text-white outline-none pl-9"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowRoomPasswordText(!showRoomPasswordText)}
+                    className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 cursor-pointer"
+                  >
+                    {showRoomPasswordText ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+                {roomPasswordError && (
+                  <p className="text-[11px] text-rose-400 font-bold flex items-center gap-1 mt-1">
+                    <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+                    <span>{roomPasswordError}</span>
+                  </p>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={handleConfirmRoomPassword}
+                  className="flex-1 py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-400 hover:to-yellow-400 text-slate-950 font-black text-xs shadow-md transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <Lock className="w-3.5 h-3.5" />
+                  <span>دخول الغرفة 🚀</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPasswordPromptRoom(null);
+                    setRoomPasswordInput('');
+                    setRoomPasswordError(null);
+                  }}
+                  className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs transition-all cursor-pointer"
+                >
+                  إلغاء
+                </button>
+              </div>
             </div>
           </div>
         )}
